@@ -7,19 +7,30 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const TSETMC = "https://cdn.tsetmc.com/api";
+const TSETMC_BASE = "https://cdn.tsetmc.com/api";
 
-const headers = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-  "Accept": "application/json, text/plain, */*",
-  "Referer": "https://www.tsetmc.com/"
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+  "Accept": "application/json,text/plain,text/csv,text/html,*/*",
+  "Referer": "https://www.tsetmc.com/",
+  "Origin": "https://www.tsetmc.com",
 };
 
+function normalizeSymbol(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\u200c/g, "")
+    .replace(/\u200f/g, "");
+}
+
 async function tseGet(path) {
-  const response = await axios.get(`${TSETMC}${path}`, {
-    headers,
+  const url = `${TSETMC_BASE}${path}`;
+
+  const response = await axios.get(url, {
+    headers: HEADERS,
     timeout: 15000,
-    validateStatus: () => true
+    validateStatus: () => true,
   });
 
   if (response.status < 200 || response.status >= 300) {
@@ -29,9 +40,8 @@ async function tseGet(path) {
   return response.data;
 }
 
-
 // ============================================================
-// TEST
+// HOME
 // ============================================================
 
 app.get("/", (req, res) => {
@@ -40,421 +50,505 @@ app.get("/", (req, res) => {
     service: "Corevyn Proxy",
     status: "ONLINE",
     endpoints: [
-      "/api/tse/اهرم",
-      "/api/tse-live/اهرم",
-      "/api/tse-history/اهرم",
-      "/api/codal/اهرم",
-      "/api/fx"
-    ]
+      "/api/tse/:symbol",
+      "/api/tse-live/:symbol",
+      "/api/tse-history/:symbol",
+      "/api/codal/:symbol",
+      "/api/fx",
+    ],
   });
 });
 
-
 // ============================================================
-// TSETMC - SEARCH + LIVE DATA
+// SEARCH SYMBOL
 // ============================================================
 
 app.get("/api/tse/:symbol", async (req, res) => {
-
-  const symbol = decodeURIComponent(req.params.symbol).trim();
+  const symbol = normalizeSymbol(req.params.symbol);
 
   try {
+    const data = await tseGet(
+      `/Instrument/GetInstrumentSearch/${encodeURIComponent(symbol)}`
+    );
 
-    // 1. Search symbol
+    const results = data?.instrumentSearch || [];
+
+    if (!results.length) {
+      return res.status(404).json({
+        success: false,
+        error: `نماد "${symbol}" پیدا نشد`,
+        symbol,
+      });
+    }
+
+    const result = results[0];
+
+    res.json({
+      success: true,
+      query: symbol,
+      instrument: result,
+    });
+  } catch (error) {
+    console.error("TSE SEARCH ERROR:", error.message);
+
+    res.status(502).json({
+      success: false,
+      error: error.message,
+      symbol,
+    });
+  }
+});
+
+// ============================================================
+// FULL LIVE ANALYSIS
+// ============================================================
+
+app.get("/api/tse-live/:symbol", async (req, res) => {
+  const symbol = normalizeSymbol(req.params.symbol);
+
+  try {
+    // --------------------------------------------------------
+    // 1. Search
+    // --------------------------------------------------------
+
     const search = await tseGet(
       `/Instrument/GetInstrumentSearch/${encodeURIComponent(symbol)}`
     );
 
-    const list = search?.instrumentSearch || [];
+    const results = search?.instrumentSearch || [];
 
-    if (!list.length) {
+    if (!results.length) {
       return res.status(404).json({
         success: false,
-        symbol,
-        error: `نماد "${symbol}" پیدا نشد`
+        error: `نماد "${symbol}" پیدا نشد`,
       });
     }
 
-    // ترجیح نمادی که نام کوتاهش دقیقاً برابر باشد
-    const match =
-      list.find(x => x.lVal18AFC === symbol) ||
-      list.find(x => x.lVal30 === symbol) ||
-      list[0];
+    const instrument = results[0];
 
-    const insCode = match.insCode;
+    const insCode = instrument.insCode;
 
-    // 2. Instrument info
+    // --------------------------------------------------------
+    // 2. Instrument information
+    // --------------------------------------------------------
+
     const infoResponse = await tseGet(
       `/Instrument/GetInstrumentInfo/${insCode}`
     );
 
-    // 3. Closing price
+    const info = infoResponse?.instrumentInfo || {};
+
+    // --------------------------------------------------------
+    // 3. Closing price / live data
+    // --------------------------------------------------------
+
     const priceResponse = await tseGet(
       `/ClosingPrice/GetClosingPriceInfo/${insCode}`
     );
 
-    const info = infoResponse?.instrumentInfo || {};
     const price = priceResponse?.closingPriceInfo || {};
 
-    const lastPrice =
-      Number(price.pDrCotVal || 0);
+    // --------------------------------------------------------
+    // 4. Order book
+    // --------------------------------------------------------
 
-    const closePrice =
-      Number(price.pClosing || 0);
+    let bestLimits = {};
+
+    try {
+      const bestResponse = await tseGet(`/BestLimits/${insCode}`);
+      bestLimits = bestResponse?.bestLimits || bestResponse || {};
+    } catch (e) {
+      console.log("BestLimits unavailable:", e.message);
+    }
+
+    // --------------------------------------------------------
+    // 5. Trade
+    // --------------------------------------------------------
+
+    let trade = {};
+
+    try {
+      const tradeResponse = await tseGet(`/Trade/GetTrade/${insCode}`);
+      trade = tradeResponse?.trade || tradeResponse || {};
+    } catch (e) {
+      console.log("Trade unavailable:", e.message);
+    }
+
+    // --------------------------------------------------------
+    // 6. Client type / حقیقی حقوقی
+    // --------------------------------------------------------
+
+    let clientType = {};
+
+    try {
+      const clientResponse = await tseGet(
+        `/ClientType/GetClientType/${insCode}/1/0`
+      );
+
+      clientType =
+        clientResponse?.clientType ||
+        clientResponse ||
+        {};
+    } catch (e) {
+      console.log("ClientType unavailable:", e.message);
+    }
+
+    // --------------------------------------------------------
+    // PRICE
+    // --------------------------------------------------------
+
+    const lastPrice =
+      Number(price.pDrCotVal) ||
+      Number(price.last) ||
+      0;
+
+    const closingPrice =
+      Number(price.pClosing) ||
+      Number(price.close) ||
+      0;
 
     const yesterday =
-      Number(price.priceYesterday || price.pClosing || 0);
-
-    const firstPrice =
-      Number(price.priceFirst || price.pf || 0);
-
-    const minPrice =
-      Number(price.priceMin || 0);
-
-    const maxPrice =
-      Number(price.priceMax || 0);
-
-    const volume =
-      Number(price.qTotTran5J || price.qTotTran || 0);
-
-    const trades =
-      Number(price.zTotTran || 0);
-
-    const value =
-      Number(price.qTotCap || price.qTotTran5J * lastPrice || 0);
+      Number(price.priceYesterday) ||
+      Number(price.pPriceYesterday) ||
+      Number(price.pClosing) ||
+      0;
 
     const change =
-      lastPrice - yesterday;
+      yesterday > 0
+        ? lastPrice - yesterday
+        : lastPrice - closingPrice;
 
     const changePercent =
       yesterday > 0
-        ? Number(((change / yesterday) * 100).toFixed(2))
+        ? (change / yesterday) * 100
         : 0;
 
-    // EPS / PE
-    const eps = Number(
-      info.eps ||
-      info.epsTTM ||
-      0
-    );
+    const volume =
+      Number(price.qTotTran5J) ||
+      Number(price.zTotTrd) ||
+      Number(price.volume) ||
+      0;
 
-    const pe = Number(
-      info.pe ||
-      info.pePsu ||
-      0
-    );
+    const value =
+      Number(price.qTotCap) ||
+      Number(price.totValue) ||
+      0;
 
-    // ========================================================
-    // SIGNAL
-    // ========================================================
+    // --------------------------------------------------------
+    // LIMITS
+    // --------------------------------------------------------
+
+    const bestBuy =
+      Number(bestLimits?.[0]?.pMeDem) ||
+      Number(bestLimits?.[0]?.buyPrice) ||
+      0;
+
+    const bestSell =
+      Number(bestLimits?.[0]?.pMeOf) ||
+      Number(bestLimits?.[0]?.sellPrice) ||
+      0;
+
+    // --------------------------------------------------------
+    // FUNDAMENTAL
+    // --------------------------------------------------------
+
+    const eps =
+      Number(info.eps) ||
+      Number(info.deven?.eps) ||
+      0;
+
+    const pe =
+      Number(info.pe) ||
+      Number(info.deven?.pe) ||
+      0;
+
+    const nav =
+      Number(info.nav) ||
+      Number(info.deven?.nav) ||
+      0;
+
+    const baseVolume =
+      Number(info.baseVolume) ||
+      Number(info.deven?.bvol) ||
+      0;
+
+    // --------------------------------------------------------
+    // ANALYSIS
+    // --------------------------------------------------------
 
     let score = 0;
     const reasons = [];
 
     if (changePercent >= 3) {
       score += 3;
-      reasons.push(`رشد قوی ${changePercent}%`);
-    }
-    else if (changePercent >= 1) {
+      reasons.push(`رشد قوی ${changePercent.toFixed(2)}٪`);
+    } else if (changePercent >= 1) {
       score += 2;
-      reasons.push(`رشد مثبت ${changePercent}%`);
-    }
-    else if (changePercent > 0) {
+      reasons.push(`رشد مثبت ${changePercent.toFixed(2)}٪`);
+    } else if (changePercent > 0) {
       score += 1;
-      reasons.push(`رشد جزئی ${changePercent}%`);
-    }
-    else if (changePercent <= -3) {
+      reasons.push(`رشد ملایم ${changePercent.toFixed(2)}٪`);
+    } else if (changePercent <= -3) {
       score -= 3;
-      reasons.push(`افت شدید ${changePercent}%`);
-    }
-    else if (changePercent <= -1) {
+      reasons.push(`افت شدید ${changePercent.toFixed(2)}٪`);
+    } else if (changePercent <= -1) {
       score -= 2;
-      reasons.push(`افت منفی ${changePercent}%`);
-    }
-    else if (changePercent < 0) {
+      reasons.push(`افت منفی ${changePercent.toFixed(2)}٪`);
+    } else if (changePercent < 0) {
       score -= 1;
-      reasons.push(`افت جزئی ${changePercent}%`);
-    }
-    else {
-      reasons.push("بدون تغییر قابل‌توجه");
+      reasons.push(`افت ملایم ${changePercent.toFixed(2)}٪`);
+    } else {
+      reasons.push("تغییر قیمت تقریباً خنثی است");
     }
 
-    if (maxPrice > 0 && lastPrice >= maxPrice * 0.98) {
+    if (baseVolume > 0 && volume > baseVolume) {
       score += 1;
-      reasons.push("نزدیک سقف روز");
+      reasons.push("حجم معاملات بالاتر از حجم مبنا");
     }
 
-    if (minPrice > 0 && lastPrice <= minPrice * 1.02) {
-      score -= 1;
-      reasons.push("نزدیک کف روز");
+    if (nav > 0 && lastPrice > 0) {
+      const navGap = ((nav - lastPrice) / nav) * 100;
+
+      if (navGap >= 5) {
+        score += 2;
+        reasons.push(
+          `قیمت حدود ${navGap.toFixed(1)}٪ پایین‌تر از NAV`
+        );
+      }
+
+      if (navGap <= -5) {
+        score -= 2;
+        reasons.push(
+          `قیمت حدود ${Math.abs(navGap).toFixed(1)}٪ بالاتر از NAV`
+        );
+      }
     }
 
     let signal = "NEUTRAL";
 
-    if (score >= 4) signal = "STRONG_BUY";
-    else if (score >= 2) signal = "BUY";
-    else if (score <= -4) signal = "STRONG_SELL";
-    else if (score <= -2) signal = "SELL";
+    if (score >= 4) {
+      signal = "STRONG_BUY";
+    } else if (score >= 2) {
+      signal = "BUY";
+    } else if (score <= -4) {
+      signal = "STRONG_SELL";
+    } else if (score <= -2) {
+      signal = "SELL";
+    }
+
+    const confidence = Math.min(
+      95,
+      Math.max(
+        55,
+        60 + Math.abs(score) * 7
+      )
+    );
+
+    // --------------------------------------------------------
+    // RESULT
+    // --------------------------------------------------------
 
     res.json({
       success: true,
 
-      symbol: match.lVal18AFC || symbol,
-      name: match.lVal30 || "",
+      symbol: instrument.lVal18AFC || symbol,
+
+      name:
+        instrument.lVal30 ||
+        info.lVal30 ||
+        symbol,
+
       insCode,
 
-      market: {
-        flow: match.flow,
-        flowTitle: match.flowTitle || ""
-      },
+      market: instrument.flow,
 
       data: {
         current_price: lastPrice,
-        closing_price: closePrice,
-        yesterday_price: yesterday,
-        first_price: firstPrice,
-        min_price: minPrice,
-        max_price: maxPrice,
+        closing_price: closingPrice,
+        yesterday_close: yesterday,
 
         change,
-        change_percent: changePercent,
+        change_percent: Number(changePercent.toFixed(2)),
 
         volume,
-        trades,
         value,
 
-        last_update: new Date().toISOString()
+        best_buy: bestBuy,
+        best_sell: bestSell,
+
+        last_update: new Date().toISOString(),
       },
 
       fundamental: {
         eps,
-        pe
+        pe,
+        nav,
+        base_volume,
       },
+
+      order_book: bestLimits,
+
+      trade,
+
+      client_type: clientType,
 
       analysis: {
         signal,
         score,
-        confidence: Math.min(
-          95,
-          60 + Math.abs(score) * 8
-        ),
+        confidence,
+
         reasons,
-        recommendation: recommendation(signal)
-      }
+
+        recommendation:
+          signal === "STRONG_BUY"
+            ? "خرید قوی؛ با مدیریت ریسک"
+            : signal === "BUY"
+            ? "تمایل مثبت؛ بررسی نقطه ورود"
+            : signal === "STRONG_SELL"
+            ? "فشار فروش بالا؛ احتیاط جدی"
+            : signal === "SELL"
+            ? "تمایل منفی؛ احتیاط"
+            : "خنثی؛ نیاز به تأیید بیشتر",
+      },
     });
-
   } catch (error) {
-
-    console.error("TSETMC ERROR:", error.message);
+    console.error("TSE LIVE ERROR:", error);
 
     res.status(502).json({
       success: false,
-      symbol,
       error: error.message,
-      source: "TSETMC"
+      symbol,
     });
   }
 });
-
-
-// ============================================================
-// فقط LIVE با InsCode
-// ============================================================
-
-app.get("/api/tse-live/:symbol", async (req, res) => {
-
-  const symbol = decodeURIComponent(req.params.symbol).trim();
-
-  try {
-
-    const search = await tseGet(
-      `/Instrument/GetInstrumentSearch/${encodeURIComponent(symbol)}`
-    );
-
-    const list = search?.instrumentSearch || [];
-
-    if (!list.length) {
-      return res.status(404).json({
-        success: false,
-        error: "نماد پیدا نشد"
-      });
-    }
-
-    const match =
-      list.find(x => x.lVal18AFC === symbol) ||
-      list[0];
-
-    const insCode = match.insCode;
-
-    const data = await tseGet(
-      `/ClosingPrice/GetClosingPriceInfo/${insCode}`
-    );
-
-    res.json({
-      success: true,
-      symbol: match.lVal18AFC,
-      name: match.lVal30,
-      insCode,
-      data: data.closingPriceInfo || {}
-    });
-
-  } catch (error) {
-
-    res.status(502).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
 
 // ============================================================
 // HISTORY
 // ============================================================
 
 app.get("/api/tse-history/:symbol", async (req, res) => {
-
-  const symbol = decodeURIComponent(req.params.symbol).trim();
+  const symbol = normalizeSymbol(req.params.symbol);
 
   try {
-
     const search = await tseGet(
       `/Instrument/GetInstrumentSearch/${encodeURIComponent(symbol)}`
     );
 
-    const list = search?.instrumentSearch || [];
+    const results = search?.instrumentSearch || [];
 
-    if (!list.length) {
+    if (!results.length) {
       return res.status(404).json({
         success: false,
-        error: "نماد پیدا نشد"
+        error: `نماد "${symbol}" پیدا نشد`,
       });
     }
 
-    const match =
-      list.find(x => x.lVal18AFC === symbol) ||
-      list[0];
-
-    const insCode = match.insCode;
+    const instrument = results[0];
+    const insCode = instrument.insCode;
 
     const history = await tseGet(
-      `/ClosingPrice/GetClosingPriceDailyList/${insCode}/0`
+      `/Trade/GetTradeHistory/${insCode}/0/true`
     );
 
     res.json({
       success: true,
-      symbol: match.lVal18AFC,
-      name: match.lVal30,
+      symbol: instrument.lVal18AFC || symbol,
       insCode,
-      history
+      history,
     });
-
   } catch (error) {
+    console.error("TSE HISTORY ERROR:", error.message);
 
     res.status(502).json({
       success: false,
-      error: error.message
+      error: error.message,
+      symbol,
     });
   }
 });
-
 
 // ============================================================
 // CODAL
 // ============================================================
 
 app.get("/api/codal/:symbol", async (req, res) => {
-
-  const symbol = decodeURIComponent(req.params.symbol).trim();
+  const symbol = normalizeSymbol(req.params.symbol);
 
   try {
+    const url =
+      `https://search.codal.ir/api/search?v=1&q=${encodeURIComponent(symbol)}&t=true`;
 
-    const response = await axios.get(
-      `https://search.codal.ir/api/search?v=1&q=${encodeURIComponent(symbol)}&t=true`,
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          "Accept": "application/json, text/plain, */*"
-        },
-        timeout: 15000
-      }
-    );
+    const response = await axios.get(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json,text/plain,*/*",
+      },
+      timeout: 15000,
+      validateStatus: () => true,
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`CODAL HTTP ${response.status}`);
+    }
 
     res.json({
       success: true,
       symbol,
-      data: response.data
+      data: response.data,
     });
-
   } catch (error) {
+    console.error("CODAL ERROR:", error.message);
 
     res.status(502).json({
       success: false,
+      error: error.message,
       symbol,
-      error: "خطا در دریافت اطلاعات کدال"
     });
   }
 });
-
 
 // ============================================================
 // FX
 // ============================================================
 
 app.get("/api/fx", async (req, res) => {
-
   try {
-
     const response = await axios.get(
       "https://api.boursyapi.com/v1/symbol/search?query=USD",
       {
-        timeout: 15000
+        timeout: 15000,
       }
     );
 
     res.json({
       success: true,
-      data: response.data
+      data: response.data,
     });
-
   } catch (error) {
-
     res.status(502).json({
       success: false,
-      error: "خطا در دریافت ارز"
+      error: "خطا در دریافت ارز",
+      detail: error.message,
     });
   }
 });
 
+// ============================================================
+// HEALTH
+// ============================================================
+
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    status: "healthy",
+    service: "Corevyn Proxy",
+    time: new Date().toISOString(),
+  });
+});
 
 // ============================================================
-// HELPERS
-// ============================================================
-
-function recommendation(signal) {
-
-  switch (signal) {
-
-    case "STRONG_BUY":
-      return "خرید قوی؛ مومنتوم مثبت است";
-
-    case "BUY":
-      return "تمایل صعودی؛ بررسی نقطه ورود";
-
-    case "STRONG_SELL":
-      return "فشار فروش بالا؛ احتیاط شدید";
-
-    case "SELL":
-      return "تمایل نزولی؛ احتیاط";
-
-    default:
-      return "روند خنثی؛ نیازمند بررسی بیشتر";
-  }
-}
-
-
-// ============================================================
-// START
+// SERVER
 // ============================================================
 
 const PORT = process.env.PORT || 3000;
